@@ -48,8 +48,7 @@ from ..tokenizer import SmilesTokenizer, TokenizationError
 
 RDLogger.DisableLog("rdApp.*")
 
-__all__ = ["StandardizeConfig", "standardize",
-           "prepare", "SUBSETS", "shard_dir"]
+__all__ = ["StandardizeConfig", "standardize", "prepare", "SUBSETS", "shard_dir"]
 
 CHEMBL_RELEASE = 35
 CHEMBL_URL = (
@@ -58,13 +57,11 @@ CHEMBL_URL = (
 )
 
 #: Named subset sizes. ``None`` means "every molecule that survives standardisation".
-SUBSETS: dict[str, int | None] = {
-    "10k": 10_000, "100k": 100_000, "1m": 1_000_000, "full": None}
+SUBSETS: dict[str, int | None] = {"10k": 10_000, "100k": 100_000, "1m": 1_000_000, "full": None}
 
 #: Organic chemistry as the model will see it. Exotic elements are rare enough
 #: in ChEMBL that they only add vocabulary the decoder cannot learn to place.
-ALLOWED_ELEMENTS = frozenset(
-    {"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "Br", "I"})
+ALLOWED_ELEMENTS = frozenset({"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "Br", "I"})
 
 
 @dataclass(frozen=True)
@@ -193,8 +190,7 @@ def _imap_bounded(pool, func: Callable, items: Iterable, window: int) -> Iterato
     if window < 1:
         raise ValueError(f"window must be >= 1, got {window}")
     iterator = iter(items)
-    pending = deque(pool.apply_async(func, (item,))
-                    for item in islice(iterator, window))
+    pending = deque(pool.apply_async(func, (item,)) for item in islice(iterator, window))
     while pending:
         result = pending.popleft().get()
         for item in islice(iterator, 1):
@@ -207,8 +203,7 @@ def download_chembl(data_dir: Path, release: int = CHEMBL_RELEASE) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
     dest = data_dir / f"chembl_{release}_chemreps.txt.gz"
     if dest.exists() and dest.stat().st_size > 0:
-        click.echo(
-            f"using cached {dest.name} ({dest.stat().st_size / 1e6:.0f} MB)")
+        click.echo(f"using cached {dest.name} ({dest.stat().st_size / 1e6:.0f} MB)")
         return dest
 
     url = CHEMBL_URL.format(release=release)
@@ -233,8 +228,7 @@ def read_raw_smiles(path: Path) -> list[str]:
         try:
             col = header.index("canonical_smiles")
         except ValueError as exc:
-            raise ValueError(
-                f"no canonical_smiles column in {path}; found {header}") from exc
+            raise ValueError(f"no canonical_smiles column in {path}; found {header}") from exc
         for line in tqdm(handle, desc="reading", unit=" rows"):
             parts = line.rstrip("\n").split("\t")
             if len(parts) > col and parts[col]:
@@ -262,7 +256,9 @@ def _scaffold_split(
     chemistry it has seen the shape of, this one on chemistry it has not.
     """
     groups: dict[str, list[str]] = {}
-    for smiles in molecules:
+    # One core, every molecule re-parsed: minutes on a large shard, so it gets a
+    # bar rather than looking like a hang after the standardisation bar fills.
+    for smiles in tqdm(molecules, desc="scaffold split", unit=" mol"):
         groups.setdefault(_murcko_scaffold(smiles), []).append(smiles)
 
     # Largest groups into train first, so the small splits stay close to their
@@ -328,19 +324,16 @@ def prepare(
         The shard directory.
     """
     if subset not in SUBSETS:
-        raise ValueError(
-            f"unknown subset {subset!r}; expected one of {sorted(SUBSETS)}")
+        raise ValueError(f"unknown subset {subset!r}; expected one of {sorted(SUBSETS)}")
 
     out_dir = shard_dir(data_dir, subset)
     if out_dir.exists() and not overwrite:
         if (out_dir / "meta.json").exists():
-            click.echo(
-                f"{out_dir} already prepared; pass --overwrite to rebuild")
+            click.echo(f"{out_dir} already prepared; pass --overwrite to rebuild")
             return out_dir
         shutil.rmtree(out_dir)
 
-    raw_path = Path(source) if source else download_chembl(
-        Path(data_dir) / "raw", release)
+    raw_path = Path(source) if source else download_chembl(Path(data_dir) / "raw", release)
     raw = read_raw_smiles(raw_path)
     click.echo(f"{len(raw):,} raw records")
 
@@ -353,7 +346,7 @@ def prepare(
     molecules: list[str] = []
 
     chunk_size = 2000
-    chunks = [raw[i: i + chunk_size] for i in range(0, len(raw), chunk_size)]
+    chunks = [raw[i : i + chunk_size] for i in range(0, len(raw), chunk_size)]
     desc = f"standardising -> {subset}"
     workers = processes or os.cpu_count() or 1
     with Pool(workers, initializer=_init_worker, initargs=(cfg,)) as pool:
@@ -382,8 +375,7 @@ def prepare(
         pool.join()
 
     if target and len(molecules) < target:
-        click.echo(
-            f"warning: only {len(molecules):,} molecules available, wanted {target:,}")
+        click.echo(f"warning: only {len(molecules):,} molecules available, wanted {target:,}")
     click.echo(f"{len(molecules):,} unique standardised molecules")
 
     excluded: list[str] = []
@@ -395,8 +387,7 @@ def prepare(
         click.echo(f"excluding {len(blocked):,} molecules named by --exclude")
         kept = [m for m in molecules if m not in blocked]
         excluded = [m for m in molecules if m in blocked]
-        click.echo(
-            f"{len(excluded):,} of them were present; {len(kept):,} molecules remain")
+        click.echo(f"{len(excluded):,} of them were present; {len(kept):,} molecules remain")
         molecules = kept
 
     # Random split. Deduplication happened above, so no canonical SMILES can
@@ -408,8 +399,8 @@ def prepare(
     n_valid = int(len(shuffled) * valid_frac)
     splits = {
         "test": shuffled[:n_test],
-        "valid": shuffled[n_test: n_test + n_valid],
-        "train": shuffled[n_test + n_valid:],
+        "valid": shuffled[n_test : n_test + n_valid],
+        "train": shuffled[n_test + n_valid :],
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -419,8 +410,7 @@ def prepare(
     if excluded:
         (out_dir / "excluded.smi").write_text("\n".join(excluded) + "\n")
 
-    scaffold_splits = _scaffold_split(
-        molecules, valid_frac, test_frac, seed + 2)
+    scaffold_splits = _scaffold_split(molecules, valid_frac, test_frac, seed + 2)
     scaffold_dir = out_dir / "scaffold"
     scaffold_dir.mkdir(exist_ok=True)
     for name, members in scaffold_splits.items():
@@ -447,8 +437,7 @@ def prepare(
     kept = reasons["ok"]
     consumed = sum(reasons.values())
     if consumed:
-        click.echo(
-            f"  standardisation kept {kept / consumed:.1%} of {consumed:,} records consumed")
+        click.echo(f"  standardisation kept {kept / consumed:.1%} of {consumed:,} records consumed")
     return out_dir
 
 
@@ -486,8 +475,7 @@ def main(
         data_dir=data_dir,
         release=release,
         source=source,
-        cfg=StandardizeConfig(
-            max_heavy_atoms=max_heavy_atoms, max_tokens=max_tokens),
+        cfg=StandardizeConfig(max_heavy_atoms=max_heavy_atoms, max_tokens=max_tokens),
         seed=seed,
         processes=processes,
         overwrite=overwrite,
