@@ -16,7 +16,7 @@
 # so the wall clock is the real control and the epoch count only sets the
 # learning-rate schedule's horizon.
 shard_dir: data/shards/1m
-out_dir: checkpoints/small_1m
+out_dir: checkpoints/small_1m_8e
 
 fingerprint:
   radius: 2
@@ -34,7 +34,7 @@ model:
   max_tokens: 128
 
 train:
-  epochs: 3
+  epochs: 8
   batch_size: 128
   lr: 0.0005
   warmup_steps: 300
@@ -47,5 +47,5 @@ train:
   # No early stop on patience: the point of this run is the shape of the whole
   # curve, including any plateau. The wall clock is the only brake.
   patience: 0
-  max_hours: 8.5
+  max_hours: 12
   num_workers: 4
