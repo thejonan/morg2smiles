@@ -40,3 +40,4 @@ train:
   patience: 0
   max_steps: 2127
   max_hours: 1.5
+  num_workers: 4

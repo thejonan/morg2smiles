@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "rdkit>=2024.3",
+    # Pinned exactly, like environment.yml, which says why: shards, training
+    # fingerprints and the oracle all depend on the RDKit release, so every
+    # machine and every run must use the same one.
+    "rdkit==2026.3.3",
     "torch>=2.4",
     "numpy",
     "pandas",

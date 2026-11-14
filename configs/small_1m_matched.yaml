@@ -40,3 +40,4 @@ train:
   # Matched to configs/small.yaml's 12 epochs x 709 steps.
   max_steps: 8508
   max_hours: 2.7
+  num_workers: 4

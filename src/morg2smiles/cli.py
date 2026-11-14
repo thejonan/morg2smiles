@@ -29,6 +29,12 @@ def main() -> None:
 @click.option("--source", type=click.Path(exists=True, path_type=Path), help="Local chemreps file.")
 @click.option("--overwrite", is_flag=True)
 @click.option(
+    "--uncharge/--keep-charges",
+    default=True,
+    show_default=True,
+    help="Neutralise charges where possible, or keep them (in shards/<subset>-keep-charges).",
+)
+@click.option(
     "--exclude",
     multiple=True,
     type=click.Path(exists=True, path_type=Path),
@@ -39,15 +45,18 @@ def prepare(
     data_dir: Path,
     source: Path | None,
     overwrite: bool,
+    uncharge: bool,
     exclude: tuple[Path, ...],
 ) -> None:
     """Download and standardise a ChEMBL subset into train/valid/test shards."""
+    from .data.prepare import StandardizeConfig
     from .data.prepare import prepare as _prepare
 
     _prepare(
         subset=subset,
         data_dir=data_dir,
         source=source,
+        cfg=StandardizeConfig(uncharge=uncharge),
         overwrite=overwrite,
         exclude=exclude,
     )

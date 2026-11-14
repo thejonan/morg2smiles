@@ -48,3 +48,4 @@ train:
   # curve, including any plateau. The wall clock is the only brake.
   patience: 0
   max_hours: 8.5
+  num_workers: 4

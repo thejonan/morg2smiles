@@ -155,3 +155,4 @@ train:
   # 19 -- max_hours built on perf_counter, which does not advance while the
   # process is suspended -- is fixed and this is true wall clock.
   max_hours: 31.0
+  num_workers: 4

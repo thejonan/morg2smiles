@@ -21,7 +21,15 @@ from torch.utils.data import DataLoader
 from morg2smiles.data.dataset import FingerprintDataset, collate, load_split
 from morg2smiles.model import build_model, select_device
 from morg2smiles.tokenizer import SmilesTokenizer
-from morg2smiles.train import load_configs
+from morg2smiles.train import load_configs, wrap_data_parallel
+
+
+def _synchronize(device: torch.device) -> None:
+    """Wait for queued GPU work, so the clock reads finished steps, not queued ones."""
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
 
 
 @click.command()
@@ -29,7 +37,17 @@ from morg2smiles.train import load_configs
 @click.option("--workers", default="0,4", help="Comma-separated worker counts.")
 @click.option("--warmup", default=10, show_default=True)
 @click.option("--measure", default=40, show_default=True)
-def main(config: tuple[str, ...], workers: str, warmup: int, measure: int) -> None:
+@click.option(
+    "--data-parallel",
+    is_flag=True,
+    help=(
+        "Split each batch across every visible CUDA GPU, as train.data_parallel "
+        "does. Compare against a run without it to see what the extra GPUs buy."
+    ),
+)
+def main(
+    config: tuple[str, ...], workers: str, warmup: int, measure: int, data_parallel: bool
+) -> None:
     device = select_device()
     worker_counts = [int(w) for w in workers.split(",")]
 
@@ -61,6 +79,8 @@ def main(config: tuple[str, ...], workers: str, warmup: int, measure: int) -> No
                 persistent_workers=n_workers > 0,
                 prefetch_factor=4 if n_workers else None,
             )
+            net = wrap_data_parallel(model, device, data_parallel)
+            n_gpus = torch.cuda.device_count() if net is not model else 1
             optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
             criterion = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
 
@@ -68,7 +88,7 @@ def main(config: tuple[str, ...], workers: str, warmup: int, measure: int) -> No
             step = 0
             for batch in loader:
                 tokens = batch["tokens"].to(device)
-                logits = model(
+                logits = net(
                     batch["fp_indices"].to(device),
                     batch["fp_counts"].to(device),
                     batch["fp_mask"].to(device),
@@ -80,21 +100,19 @@ def main(config: tuple[str, ...], workers: str, warmup: int, measure: int) -> No
                 optimizer.step()
                 step += 1
                 if step == warmup:
-                    if device.type == "mps":
-                        torch.mps.synchronize()
+                    _synchronize(device)
                     started = time.perf_counter()
                 elif step == warmup + measure:
                     break
 
-            if device.type == "mps":
-                torch.mps.synchronize()
+            _synchronize(device)
             per_step = (time.perf_counter() - started) / measure
             click.echo(
                 f"  {model.n_parameters / 1e6:5.1f}M params  workers={n_workers}  "
-                f"{per_step:.2f}s/step  -> {total_steps * per_step / 3600:5.1f}h "
+                f"gpus={n_gpus}  {per_step:.2f}s/step  -> {total_steps * per_step / 3600:5.1f}h "
                 f"for {total_steps:,} steps ({train_cfg.epochs} epoch(s))"
             )
-            del loader, dataset, model, optimizer
+            del loader, dataset, model, net, optimizer
 
 
 if __name__ == "__main__":

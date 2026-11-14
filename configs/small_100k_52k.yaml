@@ -68,3 +68,4 @@ train:
   # block 1. Hence the clock guard in scripts/overnight8.sh asks for 22 h
   # before starting at all, rather than starting and hoping.
   max_hours: 21.0
+  num_workers: 4

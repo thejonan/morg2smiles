@@ -41,7 +41,7 @@ from .metrics import format_report
 from .model import ModelConfig, build_model, select_device
 from .tokenizer import SmilesTokenizer
 
-__all__ = ["TrainConfig", "train", "set_seed"]
+__all__ = ["TrainConfig", "train", "set_seed", "wrap_data_parallel"]
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,10 @@ class TrainConfig:
     randomize_smiles: bool = True
     num_workers: int = 0
     device: str = "auto"
+    #: Split each training batch across every visible CUDA GPU with
+    #: ``nn.DataParallel``. Off by default; see :func:`wrap_data_parallel` for
+    #: what it does and does not change, and measure it before relying on it.
+    data_parallel: bool = False
     #: ``"fp32"`` or ``"bf16"``. MPS autocast support is uneven across torch
     #: versions, so fp32 is the default and bf16 is something to measure.
     precision: str = "fp32"
@@ -125,6 +129,78 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def wrap_data_parallel(model: nn.Module, device: torch.device, enabled: bool) -> nn.Module:
+    """The module to call for the training forward pass, split across GPUs if asked.
+
+    ``nn.DataParallel`` cuts each batch along its first dimension, runs the
+    pieces on every visible GPU at once, and gathers the outputs and gradients
+    on the first. The batch is still ``batch_size``, so a step means what it
+    means on one device and step-indexed results stay comparable. It is not
+    bit-identical to a one-GPU run -- dropout draws differ per device -- and
+    only the training forward pass is split: evaluation, checkpointing and the
+    optimiser keep using ``model`` itself, which shares its parameters with the
+    wrapper.
+
+    For a model of a few million parameters the per-step weight copy and the
+    single process feeding every GPU can eat most of the gain, so measure with
+    ``scripts/bench_step.py --data-parallel`` before relying on it.
+
+    Returns ``model`` unchanged when ``enabled`` is False, when the device is
+    not CUDA, or when fewer than two GPUs are visible.
+
+    Raises:
+        ValueError: If ``device`` is a CUDA device other than the first.
+            ``DataParallel`` gathers onto the first visible GPU, so the model
+            has to live there; choose GPUs with ``CUDA_VISIBLE_DEVICES``.
+    """
+    if not enabled:
+        return model
+    if device.type != "cuda":
+        print(f"data_parallel ignored: it needs CUDA devices, not {device.type}")
+        return model
+    if device.index not in (None, 0):
+        raise ValueError(
+            f"data_parallel uses every visible GPU and gathers on the first, so the model "
+            f"must be on cuda:0, not {device}; select GPUs with CUDA_VISIBLE_DEVICES instead"
+        )
+    n_gpus = torch.cuda.device_count()
+    if n_gpus < 2:
+        print(f"data_parallel ignored: {n_gpus} CUDA device(s) visible")
+        return model
+    print(f"data_parallel: each batch split across {n_gpus} GPUs")
+    return nn.DataParallel(model)
+
+
+def _train_loader(dataset, cfg: TrainConfig, *, sampler, pad_id: int) -> DataLoader:
+    """The training DataLoader.
+
+    Workers are deliberately **not** persistent. Each worker holds its own copy
+    of the dataset, and a persistent one never sees ``dataset.set_epoch()`` from
+    the main process -- so with ``num_workers > 0`` every epoch replayed epoch
+    0's random SMILES, silently switching off the augmentation this project
+    leans on hardest. Fresh workers each epoch copy the dataset as it is then.
+    Restarting them costs seconds per epoch, against thousands of steps.
+
+    With fresh workers the batches are the same as with ``num_workers=0``: the
+    shuffle is drawn in the main process, and each molecule's spelling is seeded
+    on (seed, epoch, index) rather than on which worker builds it. So
+    ``num_workers`` changes speed, not results.
+    """
+    return DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        sampler=sampler,
+        shuffle=sampler is None,
+        # partial, not a lambda: with num_workers > 0 macOS spawns worker
+        # processes and a lambda collate_fn cannot be pickled.
+        collate_fn=partial(collate, pad_id=pad_id),
+        num_workers=cfg.num_workers,
+        persistent_workers=False,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
+        drop_last=False,
+    )
+
+
 def _lr_at(step: int, total_steps: int, cfg: TrainConfig) -> float:
     """Linear warmup then cosine decay, as a multiplier on the base lr."""
     if step < cfg.warmup_steps:
@@ -177,6 +253,8 @@ def train(
 
     model = build_model(model_cfg, fp_cfg, tokenizer).to(device)
     print(f"parameters: {model.n_parameters:,}")
+    # What the training forward pass calls. Everything else uses `model`.
+    net = wrap_data_parallel(model, device, train_cfg.data_parallel)
 
     dataset = FingerprintDataset(
         train_smiles,
@@ -217,19 +295,7 @@ def train(
         for band, row in mix_summary["bands"].items():
             print(f"  {band:>8}: {row['share']:.1%} -> {row['weighted_share']:.1%}")
 
-    loader = DataLoader(
-        dataset,
-        batch_size=train_cfg.batch_size,
-        sampler=sampler,
-        shuffle=sampler is None,
-        # partial, not a lambda: with num_workers > 0 macOS spawns worker
-        # processes and a lambda collate_fn cannot be pickled.
-        collate_fn=partial(collate, pad_id=tokenizer.pad_id),
-        num_workers=train_cfg.num_workers,
-        persistent_workers=train_cfg.num_workers > 0,
-        prefetch_factor=4 if train_cfg.num_workers > 0 else None,
-        drop_last=False,
-    )
+    loader = _train_loader(dataset, train_cfg, sampler=sampler, pad_id=tokenizer.pad_id)
 
     # Weight decay on matrices only. Decaying LayerNorm gains and biases is
     # the usual accidental regulariser and costs a little accuracy for nothing.
@@ -298,7 +364,7 @@ def train(
 
     def forward_loss(batch: dict) -> torch.Tensor:
         tokens = batch["tokens"].to(device)
-        logits = model(
+        logits = net(
             batch["fp_indices"].to(device),
             batch["fp_counts"].to(device),
             batch["fp_mask"].to(device),

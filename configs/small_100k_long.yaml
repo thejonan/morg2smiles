@@ -47,3 +47,4 @@ train:
   # Matched to configs/small_1m.yaml. This is the whole point of the run.
   max_steps: 21117
   max_hours: 9.0
+  num_workers: 4

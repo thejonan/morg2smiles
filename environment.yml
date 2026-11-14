@@ -3,7 +3,14 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11
-  - rdkit>=2024.3
+  # Pinned exactly, like pyproject.toml. Shards (standardisation, canonical
+  # SMILES), training fingerprints and the oracle all come from RDKit, and a
+  # different release can change which molecules survive and which bits a
+  # molecule sets -- an exact-match oracle has no tolerance for either. Bump it
+  # deliberately, in a commit, and rebuild the shards into fresh folders when
+  # you do: the cached fp_unseen masks are keyed on the fingerprint config, not
+  # on the RDKit version.
+  - rdkit==2026.03.3
   - pytorch>=2.4
   - numpy
   - pandas

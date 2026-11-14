@@ -13,8 +13,10 @@ Standardisation choices that matter for this task:
   stereo-blind, so a target carrying stereo information asks the model to
   predict something its input cannot determine. Keeping it would put a
   permanent, invisible ceiling on recovery.
-* **Salts and solvents are stripped** to the largest fragment, and charges
-  neutralised where possible, so the corpus is one molecule per record.
+* **Salts and solvents are stripped** to the largest fragment, so the corpus
+  is one molecule per record, and by default charges are neutralised where
+  possible. ``--keep-charges`` keeps them instead; see
+  :attr:`StandardizeConfig.uncharge` for what that costs.
 * **Anything the tokenizer cannot round-trip is dropped** here rather than at
   training time, so a lossy example can never silently become the target.
 
@@ -73,6 +75,19 @@ class StandardizeConfig:
     max_tokens: int = 128
     allowed_elements: frozenset[str] = ALLOWED_ELEMENTS
     strip_stereo: bool = True
+    #: Neutralise charges where possible (RDKit's ``Uncharger``), after the
+    #: largest fragment is chosen. On by default, and every shard built before
+    #: this option existed was built with it on.
+    #:
+    #: Off keeps formal charges, which the Morgan fingerprint does see: formal
+    #: charge is one of its atom invariants. The cost is that many charges in
+    #: ChEMBL record a *salt form*, not the molecule. Stripping the counter-ion
+    #: from a sodium salt leaves the anion (``CC(=O)[O-]``), while the free acid
+    #: (``CC(=O)O``) is a separate record, so one compound can enter the corpus
+    #: twice, as two "different" molecules, possibly in different splits.
+    #: Charges that cannot be neutralised, such as quaternary ammonium, are kept
+    #: either way.
+    uncharge: bool = True
 
     def to_dict(self) -> dict:
         d = {
@@ -81,6 +96,7 @@ class StandardizeConfig:
             "max_tokens": self.max_tokens,
             "allowed_elements": sorted(self.allowed_elements),
             "strip_stereo": self.strip_stereo,
+            "uncharge": self.uncharge,
         }
         return d
 
@@ -118,7 +134,8 @@ def standardize(smiles: str, cfg: StandardizeConfig) -> tuple[str | None, str]:
         if mol is None:
             return None, "no_fragment"
         mol = rdMolStandardize.Normalize(mol)
-        mol = uncharger.uncharge(mol)
+        if cfg.uncharge:
+            mol = uncharger.uncharge(mol)
         if cfg.strip_stereo:
             Chem.RemoveStereochemistry(mol)
 
@@ -236,8 +253,34 @@ def read_raw_smiles(path: Path) -> list[str]:
     return smiles
 
 
-def shard_dir(data_dir: Path, subset: str) -> Path:
-    return Path(data_dir) / "shards" / subset
+def shard_dir(data_dir: Path, subset: str, cfg: StandardizeConfig | None = None) -> Path:
+    """Where a shard lives: ``shards/<subset>``, or ``shards/<subset>-keep-charges``.
+
+    A shard that keeps charges is a different corpus, so it gets its own folder
+    and can never be mistaken for, or overwrite, the default one. Its fp_unseen
+    masks, cached inside the folder, are kept apart the same way.
+    """
+    name = subset if cfg is None or cfg.uncharge else f"{subset}-keep-charges"
+    return Path(data_dir) / "shards" / name
+
+
+def _check_same_standardisation(meta_path: Path, cfg: StandardizeConfig) -> None:
+    """Refuse to hand back an existing shard that was built with other settings.
+
+    Without this, asking for a shard with different settings in a folder that
+    already holds one returns the old shard and reports it as prepared.
+    """
+    built = json.loads(meta_path.read_text()).get("standardize", {})
+    # Shards built before `uncharge` existed always uncharged.
+    built = {"uncharge": True, **built}
+    wanted = cfg.to_dict()
+    differing = sorted(k for k in built.keys() | wanted.keys() if built.get(k) != wanted.get(k))
+    if differing:
+        raise click.ClickException(
+            f"{meta_path.parent} was built with different standardisation "
+            f"({', '.join(differing)}); pass --overwrite to rebuild it there, "
+            "or --data-dir to build it somewhere else"
+        )
 
 
 def _murcko_scaffold(smiles: str) -> str:
@@ -326,9 +369,10 @@ def prepare(
     if subset not in SUBSETS:
         raise ValueError(f"unknown subset {subset!r}; expected one of {sorted(SUBSETS)}")
 
-    out_dir = shard_dir(data_dir, subset)
+    out_dir = shard_dir(data_dir, subset, cfg)
     if out_dir.exists() and not overwrite:
         if (out_dir / "meta.json").exists():
+            _check_same_standardisation(out_dir / "meta.json", cfg)
             click.echo(f"{out_dir} already prepared; pass --overwrite to rebuild")
             return out_dir
         shutil.rmtree(out_dir)
@@ -403,7 +447,14 @@ def prepare(
         "train": shuffled[n_test + n_valid :],
     }
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Rebuilding clears the folder first, and only now that the new shard is in
+    # hand, so a failed rebuild leaves the old one intact. Writing over it
+    # instead would leave its cached fp_unseen masks behind -- keyed on the
+    # fingerprint config, not on the molecules -- to be silently reused for the
+    # new splits.
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
     for name, members in splits.items():
         (out_dir / f"{name}.smi").write_text("\n".join(members) + "\n")
 
@@ -449,6 +500,15 @@ def prepare(
 @click.option("--seed", default=0, show_default=True)
 @click.option("--max-heavy-atoms", default=64, show_default=True)
 @click.option("--max-tokens", default=128, show_default=True)
+@click.option(
+    "--uncharge/--keep-charges",
+    default=True,
+    show_default=True,
+    help=(
+        "Neutralise charges where possible, or keep them. A keep-charges shard is "
+        "written to shards/<subset>-keep-charges; see StandardizeConfig.uncharge."
+    ),
+)
 @click.option("--processes", default=None, type=int, help="Defaults to all cores.")
 @click.option("--overwrite", is_flag=True)
 @click.option(
@@ -465,6 +525,7 @@ def main(
     seed,
     max_heavy_atoms,
     max_tokens,
+    uncharge,
     processes,
     overwrite,
     exclude,
@@ -475,7 +536,9 @@ def main(
         data_dir=data_dir,
         release=release,
         source=source,
-        cfg=StandardizeConfig(max_heavy_atoms=max_heavy_atoms, max_tokens=max_tokens),
+        cfg=StandardizeConfig(
+            max_heavy_atoms=max_heavy_atoms, max_tokens=max_tokens, uncharge=uncharge
+        ),
         seed=seed,
         processes=processes,
         overwrite=overwrite,
