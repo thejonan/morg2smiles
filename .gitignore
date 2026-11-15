@@ -250,3 +250,4 @@ dist/
 !/results/overnight10/comparison_common_t10_6p.json
 !/results/overnight10/fingerprint_ambiguity_full.json
 !/results/overnight10/fingerprint_ambiguity_full_counts.json
+/data

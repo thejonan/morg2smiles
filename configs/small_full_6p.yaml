@@ -117,7 +117,7 @@ train:
   # follows max_steps rather than the epoch count. (job4_registration.py
   # reports 88,219 for the same budget, its own rounding of 6.0 passes from
   # 88,218.56; one step in 88,000 and the same run.)
-  epochs: 7
+  epochs: 5
   batch_size: 128
   lr: 0.0005
   warmup_steps: 300
@@ -154,5 +154,5 @@ train:
   # The clock is right: train.py:404 uses time.time(), so retractions entry
   # 19 -- max_hours built on perf_counter, which does not advance while the
   # process is suspended -- is fixed and this is true wall clock.
-  max_hours: 31.0
+  max_hours: 32.0
   num_workers: 4
