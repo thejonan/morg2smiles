@@ -22,26 +22,50 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .data.dataset import fp_to_indices
+from .data.dataset import encode_fp_input
 from .defaults import DEFAULT_TEMPERATURE, TEMPERATURE_POOL
 from .fingerprints import FPConfig, Sparse
 from .model import Morg2SmilesModel, select_device
-from .oracle import OracleResult, check_many
+from .noise import ProbInput
+from .oracle import OracleResult, check_many, with_log_likelihood
 
 __all__ = ["Morg2Smiles", "sample", "beam_search", "TEMPERATURE_POOL"]
 
 
-def _as_sparse(fp: Sparse | np.ndarray | Sequence[int], cfg: FPConfig) -> Sparse:
-    """Accept a sparse dict or a dense vector, return the sparse form."""
+def _as_sparse(
+    fp: Sparse | np.ndarray | Sequence[int], cfg: FPConfig, *, probabilities: bool = False
+) -> Sparse | dict[int, float]:
+    """Accept a sparse dict or a dense vector, return the sparse form.
+
+    With ``probabilities`` the values are kept as floats in ``[0, 1]``.
+    Without it they must be whole numbers: a probability vector handed to a
+    counts model used to be truncated to count 0 for every bit, silently.
+    """
     if isinstance(fp, dict):
-        return fp
-    arr = np.asarray(fp)
-    if arr.ndim != 1:
-        raise ValueError(f"expected a 1-D fingerprint vector, got shape {arr.shape}")
-    if cfg.folded and arr.size != cfg.n_bits:
-        raise ValueError(f"expected {cfg.n_bits} bits, got {arr.size}")
-    nz = np.nonzero(arr)[0]
-    return {int(i): int(arr[i]) for i in nz}
+        items = fp.items()
+    else:
+        arr = np.asarray(fp)
+        if arr.ndim != 1:
+            raise ValueError(f"expected a 1-D fingerprint vector, got shape {arr.shape}")
+        if cfg.folded and arr.size != cfg.n_bits:
+            raise ValueError(f"expected {cfg.n_bits} bits, got {arr.size}")
+        items = ((int(i), arr[i]) for i in np.nonzero(arr)[0])
+
+    if probabilities:
+        out = {int(i): float(v) for i, v in items}
+        bad = [v for v in out.values() if not 0.0 <= v <= 1.0]
+        if bad:
+            raise ValueError(f"probabilities must lie in [0, 1], got {bad[0]}")
+        return out
+    out = {}
+    for i, v in items:
+        if float(v) != int(v):
+            raise ValueError(
+                f"bit {i} has value {v}: this model takes bits or counts, not probabilities "
+                "(probabilities need a model trained with fp_input: probability)"
+            )
+        out[int(i)] = int(v)
+    return out
 
 
 def _temperatures(value: float | Sequence[float]) -> tuple[float, ...]:
@@ -55,10 +79,13 @@ def _temperatures(value: float | Sequence[float]) -> tuple[float, ...]:
 
 
 def _batch_inputs(
-    fps: Sequence[Sparse], cfg: FPConfig, device: torch.device
+    fps: Sequence[Sparse], cfg: FPConfig, device: torch.device, prob_input: ProbInput | None = None
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Pad a list of sparse fingerprints into encoder inputs."""
-    converted = [fp_to_indices(fp, cfg) for fp in fps]
+    """Pad a list of sparse fingerprints into encoder inputs.
+
+    With ``prob_input`` the fingerprints map bits to probabilities.
+    """
+    converted = [encode_fp_input(fp, cfg, prob_input) for fp in fps]
     max_bits = max((len(i) for i, _ in converted), default=1) or 1
     n = len(converted)
 
@@ -71,6 +98,11 @@ def _batch_inputs(
         mask[i, : len(idx)] = True
 
     return indices.to(device), counts.to(device), mask.to(device)
+
+
+def _prob_input(model: Morg2SmilesModel) -> ProbInput | None:
+    """The model's probability encoding, or None for a counts model."""
+    return model.cfg.prob_input() if model.cfg.probabilistic else None
 
 
 def _filter_logits(logits: Tensor, temperature: float, top_p: float, top_k: int) -> Tensor:
@@ -125,7 +157,7 @@ def sample(
     if n == 0:
         return []
 
-    indices, counts, mask = _batch_inputs(fps, model.fp_cfg, device)
+    indices, counts, mask = _batch_inputs(fps, model.fp_cfg, device, _prob_input(model))
     memory, memory_pad_mask = model.encode_fp(indices, counts, mask)
 
     # Interleave so row (i * k + j) is sample j of fingerprint i.
@@ -197,7 +229,7 @@ def beam_search(
     max_tokens = max_tokens or model.cfg.max_tokens
     width = beam_width or k
 
-    indices, counts, mask = _batch_inputs([fp], model.fp_cfg, device)
+    indices, counts, mask = _batch_inputs([fp], model.fp_cfg, device, _prob_input(model))
     memory, memory_pad_mask = model.encode_fp(indices, counts, mask)
     memory = memory.repeat_interleave(width, dim=0)
     memory_pad_mask = memory_pad_mask.repeat_interleave(width, dim=0)
@@ -323,8 +355,18 @@ class Morg2Smiles:
             by descending similarity to the target. Consensus is the tiebreak
             because agreement among a model's own samples predicts correctness
             well and costs nothing; see docs/overnight-2026-10-15.md.
+
+            For a probability model (``fp_input: probability``), ``fp`` maps
+            bits to predicted probabilities, there is no exact match to put
+            first, and candidates are ordered by spelling count, then by the
+            log-likelihood of their fingerprint under ``fp``.
         """
-        sparse = _as_sparse(fp, self.fp_config)
+        sparse = _as_sparse(fp, self.fp_config, probabilities=self.probabilistic)
+        if verified_only and self.probabilistic:
+            raise ValueError(
+                "verified_only needs an exact fingerprint; a probability model has nothing "
+                "to verify against"
+            )
         if strategy == "sample":
             kwargs["temperature"] = temperature
         results = self._judge(sparse, k=k, strategy=strategy, oversample=oversample, **kwargs)
@@ -366,6 +408,9 @@ class Morg2Smiles:
         else:
             raise ValueError(f"unknown strategy {strategy!r}; expected 'sample' or 'beam'")
 
+        if self.probabilistic:
+            return self._rank_by_likelihood(candidates, fp, k)
+
         judged = check_many(candidates, fp, self.fp_config)
 
         # How many distinct spellings the model gave each molecule. This is the
@@ -389,6 +434,39 @@ class Morg2Smiles:
         )
         return results[:k]
 
+    def _rank_by_likelihood(
+        self, candidates: Sequence[str], probs: dict[int, float], k: int
+    ) -> list[OracleResult]:
+        """Probability mode: no exact fingerprint, so no oracle verdict to rank by.
+
+        Ranked by consensus first, as in counts mode, then by how probable each
+        candidate's fingerprint is under the predicted probabilities. ``fp_match``
+        and ``tanimoto`` are judged against the bits at p >= 0.5, which is only a
+        rough guide here.
+        """
+        thresholded = {bit: 1 for bit, p in probs.items() if p >= 0.5}
+        judged = check_many(candidates, thresholded, self.fp_config)
+        votes = Counter(r.canonical for r in judged if r.valid and r.canonical is not None)
+        results = [
+            with_log_likelihood(r, probs, self.fp_config)
+            for r in judged
+            if not r.duplicate and r.valid and r.canonical is not None
+        ]
+        no_score = float("-inf")
+        results.sort(
+            key=lambda r: (
+                votes.get(r.canonical, 0),
+                r.log_likelihood if r.log_likelihood is not None else no_score,
+            ),
+            reverse=True,
+        )
+        return results[:k]
+
+    @property
+    def probabilistic(self) -> bool:
+        """Whether this model takes predicted probabilities rather than bits."""
+        return self.model.cfg.probabilistic
+
     def generate_batch(
         self,
         fps: Iterable[Sparse | np.ndarray],
@@ -398,7 +476,7 @@ class Morg2Smiles:
         **kwargs,
     ) -> list[list[str]]:
         """Generate for many fingerprints, batched on the device."""
-        sparse = [_as_sparse(fp, self.fp_config) for fp in fps]
+        sparse = [_as_sparse(fp, self.fp_config, probabilities=self.probabilistic) for fp in fps]
         out: list[list[str]] = []
         for start in range(0, len(sparse), batch_size):
             chunk = sparse[start : start + batch_size]

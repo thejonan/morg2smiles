@@ -39,6 +39,7 @@ from .evaluation import evaluate_model
 from .fingerprints import FPConfig
 from .metrics import format_report
 from .model import ModelConfig, build_model, select_device
+from .noise import NoiseConfig
 from .tokenizer import SmilesTokenizer
 
 __all__ = ["TrainConfig", "train", "set_seed", "wrap_data_parallel"]
@@ -110,6 +111,15 @@ class TrainConfig:
     #: "3 epochs" against "12 epochs" varies data and compute together and
     #: cannot say which one moved the result.
     max_steps: int | None = None
+    #: Probability models only (``model.fp_input: probability``): the simulated
+    #: predictor whose output the model trains on, as the keys of
+    #: :class:`~morg2smiles.noise.NoiseConfig`. Validation queries use the same
+    #: predictor with no clean samples. None trains and validates on the exact
+    #: fingerprints at p = 1.
+    noise: dict | None = None
+
+    def noise_config(self) -> NoiseConfig | None:
+        return NoiseConfig.from_dict(self.noise) if self.noise is not None else None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -256,6 +266,15 @@ def train(
     # What the training forward pass calls. Everything else uses `model`.
     net = wrap_data_parallel(model, device, train_cfg.data_parallel)
 
+    noise = train_cfg.noise_config()
+    if noise is not None and not model.cfg.probabilistic:
+        raise ValueError("train.noise needs model.fp_input: probability")
+    prob_input = model.cfg.prob_input() if model.cfg.probabilistic else None
+    eval_noise = noise.for_evaluation() if noise is not None else None
+    if prob_input is not None:
+        print(f"input: probabilities {prob_input.to_dict()}")
+        print(f"noise: {noise.to_dict() if noise else 'none (exact fingerprints at p = 1)'}")
+
     dataset = FingerprintDataset(
         train_smiles,
         fp_cfg,
@@ -263,6 +282,8 @@ def train(
         max_tokens=model.cfg.max_tokens,
         randomize=train_cfg.randomize_smiles,
         seed=train_cfg.seed,
+        prob_input=prob_input,
+        noise=noise,
     )
     # Weighted sampling draws *with replacement*, so an epoch sees the same
     # number of molecules and the run stays step-for-step comparable with an
@@ -344,6 +365,9 @@ def train(
         max_tokens=model.cfg.max_tokens,
         randomize=False,  # a moving target would make the curve unreadable
         seed=train_cfg.seed,
+        # Fixed per molecule too (epoch stays 0), for the same reason.
+        prob_input=prob_input,
+        noise=eval_noise,
     )
     loss_loader = DataLoader(
         loss_dataset,
@@ -414,6 +438,7 @@ def train(
             eval_smiles,
             k=train_cfg.eval_k,
             fp_unseen=eval_mask,
+            noise=eval_noise,
             show_progress=show_progress,
         )
         vloss = validation_loss()

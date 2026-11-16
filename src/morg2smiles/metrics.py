@@ -28,6 +28,7 @@ from .oracle import OracleResult
 __all__ = ["QueryOutcome", "recovery_at_k", "structure_accuracy_at_k", "evaluate", "SLICES"]
 
 SLICES = ("all", "fp_unseen")
+ORDERS = ("generation", "consensus", "likelihood", "consensus_likelihood")
 
 
 @dataclass
@@ -103,6 +104,25 @@ class QueryOutcome:
         ordered = sorted(self.scored(), key=lambda r: -counts.get(r.canonical, 0))
         return ordered if k is None else ordered[:k]
 
+    def scored_by_likelihood(self, k: int | None = None) -> list[OracleResult]:
+        """The k budget's candidates, most probable fingerprint first.
+
+        Probability mode only: orders by
+        :attr:`~morg2smiles.oracle.OracleResult.log_likelihood`, which is how a
+        caller without an oracle would rank. Candidates without one sort last.
+        """
+        ordered = sorted(self.scored(), key=lambda r: -_likelihood(r))
+        return ordered if k is None else ordered[:k]
+
+    def scored_by_consensus_likelihood(self, k: int | None = None) -> list[OracleResult]:
+        """Most-often-proposed first, likelihood breaking ties: what
+        :meth:`morg2smiles.generate.Morg2Smiles.generate` returns in probability mode."""
+        counts = self.spelling_counts()
+        ordered = sorted(
+            self.scored(), key=lambda r: (-counts.get(r.canonical, 0), -_likelihood(r))
+        )
+        return ordered if k is None else ordered[:k]
+
     @property
     def n_candidates(self) -> int:
         """Distinct candidates judged by the oracle -- the oracle's workload."""
@@ -121,6 +141,10 @@ class QueryOutcome:
         return None
 
 
+def _likelihood(result: OracleResult) -> float:
+    return result.log_likelihood if result.log_likelihood is not None else float("-inf")
+
+
 def _slice(outcomes: Sequence[QueryOutcome], name: str) -> list[QueryOutcome]:
     if name == "all":
         return list(outcomes)
@@ -134,7 +158,11 @@ def _candidates(outcome: QueryOutcome, k: int, order: str) -> list[OracleResult]
         return outcome.scored(k)
     if order == "consensus":
         return outcome.scored_by_consensus(k)
-    raise ValueError(f"unknown order {order!r}; expected 'generation' or 'consensus'")
+    if order == "likelihood":
+        return outcome.scored_by_likelihood(k)
+    if order == "consensus_likelihood":
+        return outcome.scored_by_consensus_likelihood(k)
+    raise ValueError(f"unknown order {order!r}; expected one of {ORDERS}")
 
 
 def recovery_at_k(outcomes: Sequence[QueryOutcome], k: int, order: str = "generation") -> float:
@@ -170,6 +198,19 @@ def structure_accuracy_at_k(
     return hits / len(outcomes)
 
 
+def _likelihood_metrics(outcomes: Sequence[QueryOutcome], ks: Sequence[int]) -> dict:
+    if not any(r.log_likelihood is not None for o in outcomes for r in o.results):
+        return {}
+    return {
+        f"{metric}_{order}": {str(k): fn(outcomes, k, order=order) for k in ks}
+        for order in ("likelihood", "consensus_likelihood")
+        for metric, fn in (
+            ("recovery_at_k", recovery_at_k),
+            ("structure_accuracy_at_k", structure_accuracy_at_k),
+        )
+    }
+
+
 def _slice_metrics(outcomes: Sequence[QueryOutcome], ks: Sequence[int]) -> dict:
     if not outcomes:
         return {"n_queries": 0}
@@ -192,6 +233,9 @@ def _slice_metrics(outcomes: Sequence[QueryOutcome], ks: Sequence[int]) -> dict:
         "structure_accuracy_at_k_consensus": {
             str(k): structure_accuracy_at_k(outcomes, k, order="consensus") for k in ks
         },
+        # Probability mode only (absent otherwise, so counts-mode reports are
+        # unchanged): the orders a caller without an oracle can use.
+        **_likelihood_metrics(outcomes, ks),
         # Fraction of what the model emitted that RDKit accepts, counted over
         # every candidate including same-molecule respellings. Those are marked
         # rather than dropped precisely so this denominator stays a property of

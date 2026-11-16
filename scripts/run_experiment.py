@@ -56,6 +56,14 @@ def append_record(record: dict, path: Path = LEADERBOARD) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
+def _evaluation_noise(model, train_cfg):
+    """The noise to query a probability model with: its training predictor, all noisy."""
+    noise = train_cfg.noise_config()
+    if noise is None or not model.cfg.probabilistic:
+        return None
+    return noise.for_evaluation()
+
+
 @click.command()
 @click.option("--config", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -177,6 +185,9 @@ def main(
         budget=budget,
         oversample=oversample,
         max_oversample=max_oversample,
+        # Probability models are queried with the training predictor's output,
+        # judged against the true fingerprint. None for counts models.
+        noise=_evaluation_noise(model, train_cfg),
     )
     click.echo("")
     click.secho("model", bold=True)

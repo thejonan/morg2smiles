@@ -23,12 +23,14 @@ import json
 import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from rdkit import Chem, RDLogger
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from ..fingerprints import FPConfig, Sparse, compute
+from ..noise import NoiseConfig, ProbInput, clean_probabilities, simulate
 from ..tokenizer import SmilesTokenizer
 
 RDLogger.DisableLog("rdApp.*")
@@ -38,6 +40,7 @@ __all__ = [
     "collate",
     "load_split",
     "fp_to_indices",
+    "encode_fp_input",
     "fp_unseen_mask",
     "randomize_smiles",
     "size_weights",
@@ -156,12 +159,32 @@ def fp_to_indices(fp: Sparse, cfg: FPConfig) -> tuple[list[int], list[int]]:
     return indices, counts
 
 
+def encode_fp_input(
+    fp: Sparse | dict[int, float], cfg: FPConfig, prob_input: ProbInput | None = None
+) -> tuple[list[int], list[int]]:
+    """Encoder inputs for one fingerprint: ``(embedding indices, counts or levels)``.
+
+    With ``prob_input`` the values of ``fp`` are probabilities and become
+    probability levels (see :class:`~morg2smiles.noise.ProbInput`); without it
+    they are counts, as :func:`fp_to_indices` has always handled them.
+    """
+    if prob_input is None:
+        return fp_to_indices(fp, cfg)
+    return prob_input.levels(fp)
+
+
 class FingerprintDataset(Dataset):
     """Pairs of (fingerprint, SMILES token ids).
 
     The fingerprint is always computed from the *canonical* molecule, while the
     target string may be a random traversal of it. That asymmetry is the point:
     one input, many correct outputs.
+
+    With ``prob_input`` the fingerprint is fed as probabilities: through
+    ``noise`` when given, so the model trains on what a predictor would output,
+    and as the exact fingerprint at p = 1 otherwise. Noise is seeded on (seed,
+    epoch, index) like the SMILES augmentation, so each epoch sees a fresh
+    corruption and dataloader workers agree.
     """
 
     def __init__(
@@ -173,7 +196,13 @@ class FingerprintDataset(Dataset):
         max_tokens: int = 128,
         randomize: bool = False,
         seed: int = 0,
+        prob_input: ProbInput | None = None,
+        noise: NoiseConfig | None = None,
     ):
+        if noise is not None and prob_input is None:
+            raise ValueError("noise needs a probability-input model (fp_input: probability)")
+        self.prob_input = prob_input
+        self.noise = noise
         self.smiles = smiles
         self.fp_cfg = fp_cfg
         self.tokenizer = tokenizer
@@ -212,7 +241,17 @@ class FingerprintDataset(Dataset):
             ids = self.tokenizer.encode(canonical)[: self.max_tokens]
 
         fp = compute(canonical, self.fp_cfg)
-        indices, counts = fp_to_indices(fp, self.fp_cfg)
+        if self.prob_input is None:
+            indices, counts = fp_to_indices(fp, self.fp_cfg)
+        else:
+            if self.noise is None:
+                probs = clean_probabilities(fp)
+            else:
+                # A stream of its own, so adding noise leaves the SMILES
+                # augmentation of every sample exactly as it was.
+                rng = np.random.default_rng([self.seed, self.epoch, i, 1])
+                probs = simulate(fp, self.fp_cfg.n_bits, self.noise, rng)
+            indices, counts = self.prob_input.levels(probs)
         return {
             "fp_indices": torch.tensor(indices, dtype=torch.long),
             "fp_counts": torch.tensor(counts, dtype=torch.long),

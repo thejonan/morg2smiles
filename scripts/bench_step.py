@@ -69,6 +69,10 @@ def main(
                 max_tokens=model.cfg.max_tokens,
                 randomize=train_cfg.randomize_smiles,
                 seed=0,
+                # Probability models feed more tokens per molecule, so time them
+                # on the noisy inputs they will train on.
+                prob_input=model.cfg.prob_input() if model.cfg.probabilistic else None,
+                noise=train_cfg.noise_config() if model.cfg.probabilistic else None,
             )
             loader = DataLoader(
                 dataset,

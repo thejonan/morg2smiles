@@ -37,6 +37,7 @@ from torch import Tensor, nn
 
 from .data.dataset import MAX_COUNT
 from .fingerprints import FPConfig
+from .noise import ProbInput
 from .tokenizer import SmilesTokenizer
 
 __all__ = ["ModelConfig", "Morg2SmilesModel", "build_model", "select_device", "LayerCache"]
@@ -77,14 +78,39 @@ class ModelConfig:
     vocab_size: int = 0
     #: Fingerprint identifier space; set from :attr:`FPConfig.vocab_size`.
     fp_vocab_size: int = 2048
+    #: What a fingerprint token carries besides its bit: ``"counts"`` (exact
+    #: fingerprints, the default) or ``"probability"`` (a predicted
+    #: fingerprint, bit -> probability; see :mod:`morg2smiles.noise`).
+    fp_input: str = "counts"
+    #: Probability mode only: levels, token cap and floor; see
+    #: :class:`~morg2smiles.noise.ProbInput`.
+    prob_bins: int = 16
+    prob_max_bits: int = 128
+    prob_min: float = 0.05
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads:
             raise ValueError(f"d_model {self.d_model} not divisible by n_heads {self.n_heads}")
+        if self.fp_input not in ("counts", "probability"):
+            raise ValueError(f"fp_input must be 'counts' or 'probability', got {self.fp_input!r}")
+        self.prob_input()  # validates the probability settings
 
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
+
+    @property
+    def probabilistic(self) -> bool:
+        return self.fp_input == "probability"
+
+    def prob_input(self) -> ProbInput:
+        """The probability encoding these settings describe."""
+        return ProbInput(self.prob_bins, self.prob_max_bits, self.prob_min)
+
+    @property
+    def n_levels(self) -> int:
+        """Rows of the count/probability-level table, padding row included."""
+        return self.prob_bins + 1 if self.probabilistic else MAX_COUNT + 1
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -272,8 +298,10 @@ class FPSetEncoder(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.bit_embedding = nn.Embedding(cfg.fp_vocab_size, cfg.d_model)
-        # Index 0 is unused (counts start at 1) but kept so clamping is simple.
-        self.count_embedding = nn.Embedding(MAX_COUNT + 1, cfg.d_model)
+        # One row per count (counts mode) or probability level (probability
+        # mode). The name stays for both so existing checkpoints load. Index 0
+        # is unused (counts and levels start at 1) but kept so clamping is simple.
+        self.count_embedding = nn.Embedding(cfg.n_levels, cfg.d_model)
         self.dropout = nn.Dropout(cfg.dropout)
         layer = nn.TransformerEncoderLayer(
             d_model=cfg.d_model,
@@ -295,13 +323,15 @@ class FPSetEncoder(nn.Module):
         """
         Args:
             fp_indices: ``(batch, n_bits)`` embedding indices, zero-padded.
-            fp_counts: ``(batch, n_bits)`` counts, clamped to :data:`MAX_COUNT`.
+            fp_counts: ``(batch, n_bits)`` counts, clamped to :data:`MAX_COUNT`,
+                or probability levels in probability mode.
             fp_mask: ``(batch, n_bits)`` True at real bits.
 
         Returns:
             ``(memory, memory_pad_mask)``, the latter True at padding.
         """
-        x = self.bit_embedding(fp_indices) + self.count_embedding(fp_counts.clamp(0, MAX_COUNT))
+        levels = fp_counts.clamp(0, self.count_embedding.num_embeddings - 1)
+        x = self.bit_embedding(fp_indices) + self.count_embedding(levels)
         x = self.dropout(x)
 
         # A row with no unmasked positions makes attention softmax over an
@@ -335,6 +365,11 @@ class Morg2SmilesModel(nn.Module):
             raise ValueError(
                 f"model config fp_vocab_size={cfg.fp_vocab_size} != "
                 f"fingerprint config vocab_size {fp_cfg.vocab_size}"
+            )
+        if cfg.probabilistic and (not fp_cfg.folded or fp_cfg.counts):
+            raise ValueError(
+                "fp_input 'probability' needs a folded binary fingerprint "
+                "(folded: true, counts: false): a predictor outputs one probability per bit"
             )
         self.cfg = cfg
         self.fp_cfg = fp_cfg

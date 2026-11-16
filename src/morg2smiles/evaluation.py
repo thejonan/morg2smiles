@@ -19,7 +19,8 @@ from .fingerprints import FPConfig, compute
 from .generate import beam_search, sample
 from .metrics import QueryOutcome, evaluate
 from .model import Morg2SmilesModel
-from .oracle import OracleResult, check, check_many
+from .noise import NoiseConfig, clean_probabilities, query_rng, simulate
+from .oracle import OracleResult, check, check_many, with_log_likelihood
 
 __all__ = ["evaluate_model", "generate_outcomes"]
 
@@ -38,6 +39,8 @@ def generate_outcomes(
     oversample: float = 2.0,
     max_oversample: float = 10.0,
     seed: int | None = 0,
+    noise: NoiseConfig | None = None,
+    noise_seed: int = 0,
     show_progress: bool = True,
     **kwargs,
 ) -> list[QueryOutcome]:
@@ -81,6 +84,14 @@ def generate_outcomes(
             of recovery@20 (0.5729 against 0.5508, n=995) -- roughly 1.4
             standard errors, and easily enough to invent or hide a difference
             between two training runs. Pass None for genuinely fresh samples.
+        noise: Probability models only. The simulated predictor whose output
+            the model is queried with; None queries with the exact fingerprint
+            at p = 1. Use :meth:`NoiseConfig.for_evaluation`. Candidates are
+            still judged against the *true* fingerprint, so recovery@k keeps
+            its meaning, and each also gets a ``log_likelihood`` under the
+            noisy query, for the orders a caller without an oracle would use.
+        noise_seed: Keys the simulated prediction together with the molecule,
+            so one molecule gets the same noisy query in every evaluation.
 
     Returns:
         One :class:`QueryOutcome` per input molecule, in input order.
@@ -92,13 +103,33 @@ def generate_outcomes(
         raise ValueError(f"budget must be 'molecules' or 'strings', got {budget!r}")
 
     fps = [compute(s, fp_cfg) for s in smiles]
+    probabilistic = model.cfg.probabilistic
+    if noise is not None and not probabilistic:
+        raise ValueError("noise needs a probability-input model (fp_input: probability)")
+    if probabilistic:
+        # What the model is asked: a simulated prediction, or the exact bits.
+        queries = [
+            simulate(fp, fp_cfg.n_bits, noise, query_rng(s, noise_seed))
+            if noise is not None
+            else clean_probabilities(fp)
+            for s, fp in zip(smiles, fps, strict=True)
+        ]
+    else:
+        queries = fps
     outcomes: list[QueryOutcome] = []
     n_draw = max(k, int(round(k * oversample)))
     max_draw = max(n_draw, int(round(k * max_oversample)))
 
+    def score(index: int, r: OracleResult) -> OracleResult:
+        # Probability mode: how probable the candidate is under the query.
+        if not probabilistic or r.duplicate:
+            return r
+        return with_log_likelihood(r, queries[index], fp_cfg)
+
     def judge(index: int, candidates: Sequence[str]) -> QueryOutcome:
+        results = check_many(candidates, fps[index], fp_cfg, reference_smiles=smiles[index])
         return QueryOutcome(
-            results=check_many(candidates, fps[index], fp_cfg, reference_smiles=smiles[index]),
+            results=[score(index, r) for r in results],
             fp_unseen=bool(fp_unseen[index]) if fp_unseen is not None else False,
             reference_smiles=smiles[index],
             budget=budget,
@@ -116,7 +147,7 @@ def generate_outcomes(
         # would only add lower-ranked beams; k stays k.
         iterator = tqdm(range(len(smiles)), desc="beam", unit=" mol", disable=not show_progress)
         for i in iterator:
-            outcomes.append(judge(i, beam_search(model, fps[i], k=k, **kwargs)))
+            outcomes.append(judge(i, beam_search(model, queries[i], k=k, **kwargs)))
         return outcomes
 
     # Top-ups draw from their own stream. Sharing one would let a top-up in
@@ -152,7 +183,7 @@ def generate_outcomes(
         while pending:
             batch_candidates = sample(
                 model,
-                [fps[i] for i in pending],
+                [queries[i] for i in pending],
                 k=per_query,
                 temperature=temperature,
                 top_p=top_p,
@@ -171,7 +202,7 @@ def generate_outcomes(
                             r = replace(r, duplicate=True)
                         else:
                             seen_canonical[i].add(r.canonical)
-                    results[i].append(r)
+                    results[i].append(score(i, r))
             per_query, stream = k, topup_generator
             pending = [i for i in pending if fills(results[i]) < k and drawn[i] + k <= max_draw]
 
@@ -210,7 +241,8 @@ def evaluate_model(
     """
     ks = ks or [n for n in (1, 5, 20, 100) if n <= k] or [k]
     started = time.perf_counter()
-    outcomes = generate_outcomes(model, smiles, k=k, fp_unseen=fp_unseen, **kwargs)
+    noise = kwargs.pop("noise", None)
+    outcomes = generate_outcomes(model, smiles, k=k, fp_unseen=fp_unseen, noise=noise, **kwargs)
     elapsed = time.perf_counter() - started
     report = evaluate(outcomes, ks=ks, elapsed_seconds=elapsed)
     report["generation"] = {
@@ -221,4 +253,7 @@ def evaluate_model(
             if isinstance(value, (int, float, str, bool))
         },
     }
+    if model.cfg.probabilistic:
+        # What the model was queried with; None means the exact fingerprint.
+        report["input_noise"] = noise.to_dict() if noise is not None else None
     return report

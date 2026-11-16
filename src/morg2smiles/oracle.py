@@ -12,14 +12,22 @@ mid-evaluation would be indistinguishable from a bad model.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from rdkit import Chem, RDLogger
 
 from .fingerprints import FPConfig, Sparse, compute, equal, tanimoto
+from .noise import log_likelihood
 
-__all__ = ["OracleResult", "check", "check_many", "canonicalize", "best_result"]
+__all__ = [
+    "OracleResult",
+    "check",
+    "check_many",
+    "canonicalize",
+    "best_result",
+    "with_log_likelihood",
+]
 
 # Generation produces malformed SMILES by the thousand; RDKit's per-failure
 # console spew would bury everything else.
@@ -51,6 +59,10 @@ class OracleResult:
             which silently depresses the apparent validity of the model that
             produced them. Consumers of the k budget skip duplicates; consumers
             counting what the model emitted do not.
+        log_likelihood: Probability mode only: log-probability of the
+            candidate's fingerprint under the query's predicted bit
+            probabilities (:func:`morg2smiles.noise.log_likelihood`). None
+            when the query was an exact fingerprint.
     """
 
     smiles: str
@@ -60,6 +72,7 @@ class OracleResult:
     tanimoto: float
     canonical: str | None = None
     duplicate: bool = False
+    log_likelihood: float | None = None
 
     def __bool__(self) -> bool:
         """An oracle result is truthy when the fingerprint matches."""
@@ -200,6 +213,27 @@ def check_many(
 
         results.append(result)
     return results
+
+
+def with_log_likelihood(
+    result: OracleResult, probs: Mapping[int, float], cfg: FPConfig
+) -> OracleResult:
+    """Attach the candidate's log-likelihood under predicted bit probabilities.
+
+    The fingerprint is recomputed from the candidate *as written*, the same
+    parse :func:`check` judged, not from its canonical SMILES: RDKit's
+    canonical form of some aromatic systems does not parse back ("can't
+    kekulize"), while the spelling the model wrote did. Never raises; a
+    candidate whose fingerprint cannot be computed keeps ``log_likelihood``
+    None and ranks last.
+    """
+    if not result.valid:
+        return result
+    try:
+        bits = compute(result.smiles, cfg)
+    except Exception:
+        return result
+    return replace(result, log_likelihood=log_likelihood(bits, probs, cfg.n_bits))
 
 
 def best_result(results: Sequence[OracleResult]) -> OracleResult | None:

@@ -1,0 +1,70 @@
+# small_1m on *predicted* fingerprints: 4096-bit ECFP4 given as one probability
+# per bit, the way a spectrum-to-fingerprint predictor reports it.
+#
+# Same 8M architecture and schedule as small_1m.yaml. Two things differ:
+#
+# - model.fp_input: probability. Each fingerprint token carries a probability
+#   level (16 bins) instead of a count, and only the 128 most probable bits
+#   with p >= 0.05 are fed. See src/morg2smiles/noise.py.
+# - train.noise: the model trains on simulated predictor output -- real bits
+#   missed, spurious bits added -- with 20% of samples left exact. Validation
+#   queries are all noisy, generated from the same settings and keyed on the
+#   molecule, and candidates are still judged against the TRUE fingerprint, so
+#   recovery@k keeps its meaning.
+#
+# The noise numbers below are placeholders, not measurements. Replace them with
+# your predictor's: measure its per-bit miss and false-positive rates on its
+# own validation set and point rates_file at them (format in NoiseConfig), and
+# match the Beta confidence distributions to its calibration.
+#
+# Expect it to be slower per step than small_1m: up to 128 fingerprint tokens
+# instead of about 50. Time it first with scripts/bench_step.py.
+shard_dir: data/shards/1m
+out_dir: checkpoints/small_1m_prob4096
+
+fingerprint:
+  radius: 2
+  n_bits: 4096
+  counts: false
+  folded: true
+
+model:
+  d_model: 256
+  n_heads: 8
+  d_ff: 1024
+  n_encoder_layers: 4
+  n_decoder_layers: 4
+  dropout: 0.1
+  max_tokens: 128
+  fp_input: probability
+  prob_bins: 16
+  prob_max_bits: 128
+  prob_min: 0.05
+
+train:
+  epochs: 8
+  batch_size: 128
+  lr: 0.0005
+  warmup_steps: 300
+  randomize_smiles: true
+  eval_every_steps: 1500
+  eval_n: 500
+  eval_k: 20
+  valid_loss_n: 2000
+  patience: 0
+  max_hours: 12
+  num_workers: 4
+  noise:
+    clean_fraction: 0.2
+    # P(a real bit is missed); missed bits get a low probability.
+    miss_rate: 0.15
+    # Mean number of spurious bits per molecule.
+    false_bits: 8.0
+    # Beta(a, b) probabilities for kept real bits, missed real bits and
+    # spurious bits; the mean of Beta(a, b) is a / (a + b).
+    hit_conf: [8.0, 2.0]
+    miss_conf: [2.0, 8.0]
+    false_conf: [2.0, 5.0]
+    # Per-bit {"miss_rate": [...], "false_rate": [...]} from your predictor;
+    # overrides miss_rate and false_bits when set.
+    rates_file: null
