@@ -8,8 +8,8 @@ dist/
 
 # Data and run artefacts. Leading slashes anchor these to the repo root, so
 # they do not also swallow the src/morg2smiles/data package.
-/data/
-/checkpoints/
+/data
+/checkpoints
 /reports/
 # The leaderboard is the project's experiment ledger -- every row ties metrics
 # to a config hash and a git commit, which is what makes an iteration loop
